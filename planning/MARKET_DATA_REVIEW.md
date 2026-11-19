@@ -184,7 +184,7 @@ The current tests and lint are green. Approval for trading integration should wa
 All seven implementation findings were confirmed independently and fixed, in the order 1, 5, 2, 3, 4, 6, 7, each with regression tests. The suite is now **99 passed**, ruff is clean, and `app.market` coverage is 97% (`stream.py` 89%). Against the pre-fix code, all 18 new cache, simulator and stream tests fail. The new Massive tests cannot run against it because they import helpers that did not exist yet, so the in-flight removal test was checked by removing its guard instead; it fails without it.
 
 Documentation cautions:
-1. **EOD budget:** resolved in the code and docs. The session date is discovered once per day and cached, so later polls cost one call, and the client uses `retries=0`. The schedule is now 30 s in every doc. The code still polls every 60 s and uses the bar's `t` as `quoted_at`; both are listed as gaps in `MARKET_DATA_DESIGN.md` §10.2.
+1. **EOD budget:** resolved in the code and docs. The session date is discovered once per day and cached, so later polls cost one call, and the client uses `retries=0`. The schedule is now 30 s in every doc. The code also polls EOD every 30 s and quotes each close at 16:00 ET (added later on 2026-11-19, along with the `tzdata` dependency).
 2. **Chat revision:** still open in PLAN (`MARKET_DATA_DESIGN.md` §20, question 1).
 3. **Stale summary:** `MARKET_DATA_SUMMARY.md` has been rewritten to separate what is built from what is planned.
 

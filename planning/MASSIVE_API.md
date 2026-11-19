@@ -257,8 +257,7 @@ except BadResponse as e:
 ## 6. Polling guidance for FinAlly
 
 - **One batched snapshot call per cycle** for the whole tracked set (watchlist plus positions).
-- **Interval:** snapshots every 15 s by default (2–5 s is fine on paid plans). In EOD mode, every 30 s with the session date cached (section 4.1). That is 2 calls/min, within the free 5 calls/min, and keeps fetch age under the 60 s freshness limit even if one poll fails. (The code currently uses 60 s; see MARKET_DATA_DESIGN.md §10.2.)
-- **`retries=0`:** the poll loop is already the retry, and urllib3 retries on 429 waste free-tier quota and hide failures from `feed_status`.
+- **Interval:** snapshots every 15 s by default (2–5 s is fine on paid plans). In EOD mode, every 30 s with the session date cached (section 4.1). That is 2 calls/min, within the free 5 calls/min, and keeps fetch age under the 60 s freshness limit even if one poll fails.- **`retries=0`:** the poll loop is already the retry, and urllib3 retries on 429 waste free-tier quota and hide failures from `feed_status`.
 - **Quote time:** use the source timestamp converted to seconds as `quoted_at`. The 15-minute delay on Starter/Developer is visible as source age; it does not make the quote invalid.
 - **Missing tickers:** a requested symbol absent from the response is a per-ticker failure. Do not advance that ticker's `fetched_at`.
 - **Plan detection:** a 403 on snapshots means the key is Basic. Fall back to grouped daily EOD and log the mode once (implemented in `MassiveDataSource`). EOD closes become stale for trading after 24 hours (PLAN section 6), which is the intended behavior.

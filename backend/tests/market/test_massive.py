@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,7 +10,13 @@ from massive.exceptions import BadResponse
 from massive.rest.models import GroupedDailyAgg, TickerSnapshot
 
 from app.market.cache import PriceCache
-from app.market.massive_client import EOD_POLL_INTERVAL, MassiveDataSource, extract_quote
+from app.market.massive_client import (
+    EOD_POLL_INTERVAL,
+    US_EASTERN,
+    MassiveDataSource,
+    extract_quote,
+    session_close_ts,
+)
 
 
 def _make_snapshot(ticker: str, price: float, timestamp_ns: int) -> TickerSnapshot:
@@ -308,9 +314,10 @@ class TestMassiveFallbacks:
         assert cache.get_price("AAPL") == 189.0
 
     async def test_not_authorized_switches_to_eod(self):
-        """A 403 on snapshots switches to grouped-daily EOD prices at a 60s interval."""
-        today = datetime.now(UTC).date()
-        bar_date = (today - timedelta(days=2)).isoformat()
+        """A 403 on snapshots switches to grouped-daily EOD prices every 30 s."""
+        today = datetime.now(US_EASTERN).date()
+        session = today - timedelta(days=2)
+        bar_date = session.isoformat()
         cache = PriceCache()
         source = MassiveDataSource(api_key="test-key", price_cache=cache)
         source._tickers = ["AAPL"]
@@ -318,11 +325,12 @@ class TestMassiveFallbacks:
 
         await source._poll_once()  # snapshot rejected -> EOD mode
         assert source._eod_mode
-        assert source._interval == EOD_POLL_INTERVAL
+        assert source._interval == EOD_POLL_INTERVAL == 30.0
         assert cache.get_price("AAPL") is None
 
         await source._poll_once()  # discovery walks back to the bar date
         assert cache.get_price("AAPL") == 188.0
+        assert cache.get("AAPL").timestamp == session_close_ts(session)  # 16:00 ET, not bar t
         assert "MSFT" not in cache  # untracked tickers are filtered out
         assert len(source._client.grouped_calls) == 3
 
@@ -358,3 +366,13 @@ class TestMassiveFallbacks:
         assert source.get_tickers() == ["MSFT"]
         assert "AAPL" not in cache
         assert cache.get_price("MSFT") == 410.0
+
+
+class TestSessionClose:
+    """EOD quote time is the 16:00 America/New_York close, across DST."""
+
+    def test_winter_close_is_21_utc(self):
+        assert session_close_ts(date(2026, 11, 16)) == datetime(2026, 11, 16, 21, 0, tzinfo=UTC).timestamp()
+
+    def test_summer_close_is_20_utc(self):
+        assert session_close_ts(date(2026, 7, 16)) == datetime(2026, 7, 16, 20, 0, tzinfo=UTC).timestamp()

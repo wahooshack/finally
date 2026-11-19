@@ -1,6 +1,6 @@
 # Market Data Backend — Summary
 
-**Status (2026-11-19):** The core subsystem is built and tested (99 tests pass, 97% statement coverage of `app.market`). All seven implementation findings from `MARKET_DATA_REVIEW.md` are fixed. **The PLAN §6 quote lifecycle is not built yet**, so the core is not ready to feed trade execution. See "Still to do".
+**Status (2026-11-19):** The core subsystem is built and tested (101 tests pass, 97% statement coverage of `app.market`). All seven implementation findings from `MARKET_DATA_REVIEW.md` are fixed. **The PLAN §6 quote lifecycle is not built yet**, so the core is not ready to feed trade execution. See "Still to do".
 
 ## What exists
 
@@ -26,7 +26,7 @@ MarketDataSource (ABC)
 | `cache.py` | `PriceCache`: thread-safe store with a version counter. Rejects invalid prices (≤ 0, NaN/inf, > 1e9), non-finite or > 5 s future timestamps, and quotes older than the cached one. Stores prices unrounded. |
 | `seed_prices.py` | Seed prices, per-ticker drift/volatility, correlation groups |
 | `simulator.py` | `GBMSimulator` (correlated GBM with random shocks) and `SimulatorDataSource` |
-| `massive_client.py` | `MassiveDataSource`: one batched snapshot per poll. Price falls back from last trade to minute bar to today's bar. Switches to end-of-day grouped bars on a free key's `NOT_AUTHORIZED`. |
+| `massive_client.py` | `MassiveDataSource`: one batched snapshot per poll. Price falls back from last trade to minute bar to today's bar. Switches to end-of-day grouped bars on a free key's `NOT_AUTHORIZED`: polled every 30 s, each close quoted at 16:00 ET (needs `tzdata`). |
 | `factory.py` | `create_market_data_source()`: Massive if `MASSIVE_API_KEY` is non-empty, else the simulator |
 | `stream.py` | `create_stream_router()`: a new FastAPI SSE router per call; sends the full price map (including `{}`) whenever the cache version changes |
 
@@ -55,18 +55,17 @@ From PLAN §6 and `MARKET_DATA_DESIGN.md` (full spec with code):
 - `feed_status` / `market_mode` on sources, the named SSE `feed_status` event, a 15 s heartbeat, and status recompute every second
 - the shared REST/SSE quote serializer, and the market service with reconciliation of watchlist ∪ positions every 5 s
 - an injected RNG for the simulator, and a scripted test source for E2E
-- EOD details in the code: poll every 30 s (currently 60 s), and set `quoted_at` to the 16:00 ET close (currently the bar's `t`)
 - pin Python 3.13 locally (`.python-version`); the venv currently runs 3.14
 
 ## Tests
 
-**99 tests, all passing** (`uv run --extra dev pytest`); ruff clean.
+**101 tests, all passing** (`uv run --extra dev pytest`); ruff clean.
 
 | Module | Tests | Coverage |
 |--------|------:|---------|
 | test_cache.py | 25 | cache.py: 100% |
 | test_factory.py | 7 | factory.py: 100% |
-| test_massive.py | 22 | massive_client.py: 97% |
+| test_massive.py | 24 | massive_client.py: 97% |
 | test_models.py | 11 | models.py: 100% |
 | test_simulator.py | 19 | simulator.py: 98% |
 | test_simulator_source.py | 11 | (integration) |

@@ -2,7 +2,7 @@
 
 Implementation spec for everything in `backend/app/market/`: the unified API, the GBM simulator, the Massive (Polygon.io) client, the SSE stream, and the glue the rest of the backend uses. It turns PLAN.md section 6 (and the market parts of sections 7, 8 and 12) into code.
 
-**Status:** Design, partly implemented. The core subsystem exists and its 99 tests pass (checked 2026-11-19 with `uv run --extra dev pytest`). The seven fixes from `MARKET_DATA_REVIEW.md` are in the code:
+**Status:** Design, partly implemented. The core subsystem exists and its 101 tests pass (checked 2026-11-19 with `uv run --extra dev pytest`). The seven fixes from `MARKET_DATA_REVIEW.md` are in the code:
 - quote validation and unrounded prices
 - the §10.1 price fallback chain and EOD mode
 - ignoring tickers removed during a poll
@@ -11,7 +11,7 @@ Implementation spec for everything in `backend/app/market/`: the unified API, th
 - publishing removals to the stream
 - duplicate simulator adds as a no-op
 
-Everything else here is still to do, including the clock, freshness, `quoted_at`/`fetched_at`, the baseline, feed status, the service and the stream rewrite. Two EOD details also still differ in the code (§10.2). See `MARKET_DATA_SUMMARY.md` for the current state.
+Everything else here is still to do, including the clock, freshness, `quoted_at`/`fetched_at`, the baseline, feed status, the service and the stream rewrite. EOD mode matches §10.2, including the 30 s interval and the 16:00 ET `quoted_at`. See `MARKET_DATA_SUMMARY.md` for the current state.
 
 **Related docs**
 
@@ -868,7 +868,7 @@ API reference: `MASSIVE_API.md`. Facts checked against the installed `massive` 2
 
 - `RESTClient(api_key, connect_timeout, read_timeout, retries, ...)` is **synchronous** (urllib3).
 - `get_snapshot_all(market_type, tickers=None, ...) -> list[TickerSnapshot]`. **With `tickers` empty or None, the call returns every US stock** (~10k), so never call it with an empty list.
-- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The code used to read `snap.last_trade.timestamp`, which failed on every snapshot so no price was ever written. **Fixed 2026-11-19** (reads `sip_timestamp / 1e9`). The §10.1 fallback chain (`extract_quote`) and EOD mode are implemented too, with the two gaps listed in §10.2.
+- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The code used to read `snap.last_trade.timestamp`, which failed on every snapshot so no price was ever written. **Fixed 2026-11-19** (reads `sip_timestamp / 1e9`). The §10.1 fallback chain (`extract_quote`) and the §10.2 EOD mode are implemented too.
 - `MinuteSnapshot.close` / `.timestamp` (milliseconds); `Agg.close` for `day`; `TickerSnapshot.updated` (nanoseconds).
 - `get_grouped_daily_aggs(date, adjusted=...) -> list[GroupedDailyAgg]` with `ticker`, `close`, `timestamp` (ms).
 - Non-200 responses raise `massive.exceptions.BadResponse(body_text)`. The status code is not an attribute, so a plan restriction is detected by `"NOT_AUTHORIZED"` in `str(exc)`.
@@ -892,11 +892,12 @@ Basic keys get a 403 `NOT_AUTHORIZED` on snapshots. On the first such response, 
 - `quoted_at` for an EOD bar is that session's **16:00 America/New_York close**. The bar's own `t` is the start of the day window, which would overstate its age by 16 hours.
 - The EOD poll interval is 30 s. That is 2 calls/min (within the 5/min limit) and keeps `fetched_at` under the 60 s limit even if one poll fails. On a discovery poll, the first-403 probe plus a walk-back can reach about 5 calls in one minute. A resulting 429 is just a failed poll, retried on the next cycle.
 
-**Implementation gaps (code as of 2026-11-19):**
-1. `EOD_POLL_INTERVAL` is 60 s, not 30 s.
-2. `quoted_at` is the bar's `t`, not the 16:00 ET close, and `today` is a UTC date.
+**Implemented 2026-11-19:**
+- `EOD_POLL_INTERVAL = 30.0`.
+- `quoted_at = session_close_ts(day)`, the 16:00 America/New_York close (21:00 UTC in winter, 20:00 UTC in summer).
+- "Today" is the US/Eastern date.
 
-Both need fixing together with freshness (step 4 of §19); until freshness exists, neither changes observable behavior. Gap 2 also needs the `tzdata` dependency.
+`tzdata` was added as a dependency because Windows has no IANA timezone database (`ZoneInfo("America/New_York")` failed without it).
 - The PLAN's 24 h source-age limit makes EOD closes stale from 16:00 ET the next day until the next close publishes. Over a weekend, Friday's close is stale. **This is intended** (PLAN §6: "reject old closed-market quotes after 24 hours"). Prices still display, marked stale, and trading is disabled.
 
 ### 10.3 Code
@@ -1849,7 +1850,7 @@ Because the clock is manual, wall time does not age quotes in E2E. Tests advance
 | Massive `start()` | Does not await the first poll; feed stays `starting` until it completes | Startup and requests never block on the provider (PLAN §6). Also lets `stop()` cancel an in-flight first poll. Implemented 2026-11-19. |
 | Missing symbol in a successful Massive response | Feed stays `healthy`; the ticker is `unavailable`/`stale` and listed in `missing_tickers()` | A single mistyped watchlist symbol should not show the whole feed as degraded. Per-ticker status already shows the problem. (`MARKET_INTERFACE.md` §5.1 said `degraded`.) |
 | EOD `quoted_at` | 16:00 ET session close, not the bar's window start | The bar `t` is midnight ET, which overstates age by 16 h and would make every EOD close stale on arrival. |
-| EOD poll interval | 30 s | Below the 60 s fetch-age limit with room for one failed poll, and 2 calls/min fits the 5/min limit. (Code currently 60 s; see §10.2.) |
+| EOD poll interval | 30 s | Below the 60 s fetch-age limit with room for one failed poll, and 2 calls/min fits the 5/min limit. |
 | EOD session date | Discovered once per day and cached | Walking back on every poll exceeds the free 5 calls/min budget over weekends. |
 | Re-fetch of an unchanged quote | Advance `fetched_at` only; keep `previous_price` | Otherwise every Massive poll would reset `direction` to `flat` and kill the flash information. |
 | Out-of-order quote | Ignored, `fetched_at` unchanged | Never move a quote backward in source time. |

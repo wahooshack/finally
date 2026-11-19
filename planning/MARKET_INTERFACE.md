@@ -4,7 +4,7 @@ The unified Python API FinAlly uses for stock prices. It uses Massive when `MASS
 
 The design keeps the existing structure in `backend/app/market/` and adds the changes required by PLAN.md section 6: unrounded prices, `quoted_at` and `fetched_at`, the session baseline, freshness, feed status, an injectable clock, and a per-call stream router. API details are in MASSIVE_API.md; simulator internals are in MARKET_SIMULATOR.md. MARKET_DATA_DESIGN.md is the full spec with complete code; where the two differ, that doc wins.
 
-**Status (2026-11-19):** the items marked **Done** below are in the code (99 tests pass). Everything else is still design.
+**Status (2026-11-19):** the items marked **Done** below are in the code (101 tests pass). Everything else is still design.
 
 ## 1. Shape
 
@@ -263,7 +263,7 @@ A failed poll leaves cached prices alone. They age into `stale` on their own thr
 - The timestamp bug is fixed (`sip_timestamp / 1e9`; MASSIVE_API.md section 3.3).
 - `extract_quote()` falls back from the last trade to the minute bar to today's bar, and never uses yesterday's close (MASSIVE_API.md 3.4).
 - Each poll captures the ticker list before the request and writes results only for tickers still tracked when it returns.
-- On a 403 `NOT_AUTHORIZED` (free Basic key), the source switches once to EOD mode with grouped daily bars, discovering the session date once per day (MASSIVE_API.md 4.1). The switch is logged once.
+- On a 403 `NOT_AUTHORIZED` (free Basic key), the source switches once to EOD mode with grouped daily bars, discovering the session date once per day (MASSIVE_API.md 4.1), polling every 30 s, and quoting each close at the 16:00 ET session close. The switch is logged once.
 - `RESTClient(api_key, retries=0)`: the poll loop is the retry.
 - `start()` does not await the first poll. It runs inside the polling task, so `stop()` also cancels an in-flight first poll.
 - The default interval stays 15 s and can be overridden by the constructor argument.
@@ -271,7 +271,6 @@ A failed poll leaves cached prices alone. They age into `stale` on their own thr
 **Still to do:**
 - feed status, with `self._status` set as in §5.1
 - `market_mode = "massive"`
-- EOD polling every 30 s instead of 60 s, and EOD `quoted_at` at the 16:00 ET close (MARKET_DATA_DESIGN.md §10.2)
 
 Target shape of the poll once feed status is added:
 

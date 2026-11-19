@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from massive import RESTClient
 from massive.exceptions import BadResponse
@@ -17,8 +18,21 @@ logger = logging.getLogger(__name__)
 
 NS_PER_SECOND = 1_000_000_000
 MS_PER_SECOND = 1_000
-EOD_POLL_INTERVAL = 60.0  # grouped-daily mode: 1 call/min, within the free 5 calls/min
+# Grouped-daily mode: 2 calls/min fits the free 5 calls/min, and keeps fetch age
+# under the 60 s freshness limit even if one poll fails.
+EOD_POLL_INTERVAL = 30.0
 EOD_MAX_LOOKBACK_DAYS = 5  # weekends plus a holiday
+US_EASTERN = ZoneInfo("America/New_York")  # needs the tzdata package on Windows
+SESSION_CLOSE = time(16, 0)
+
+
+def session_close_ts(day: date) -> float:
+    """Unix seconds of the 16:00 ET close on `day`, the source time of its EOD bar.
+
+    A daily bar's own `t` is the start of the day window, which would overstate
+    the close's age by 16 hours.
+    """
+    return datetime.combine(day, SESSION_CLOSE, tzinfo=US_EASTERN).timestamp()
 
 
 def extract_quote(snap: TickerSnapshot) -> tuple[float, float] | None:
@@ -49,7 +63,7 @@ class MassiveDataSource(MarketDataSource):
     once to end-of-day mode: grouped daily bars, polled every EOD_POLL_INTERVAL.
 
     Rate limits:
-      - Free tier: 5 req/min → EOD mode, 1 call/min after daily date discovery
+      - Free tier: 5 req/min → EOD mode, 2 calls/min after daily date discovery
       - Paid tiers: snapshot every 15s (default) or faster
     """
 
@@ -67,7 +81,7 @@ class MassiveDataSource(MarketDataSource):
         self._client: RESTClient | None = None
         self._eod_mode = False
         self._eod_date: date | None = None  # latest trading date with bars
-        self._eod_checked: date | None = None  # UTC day the date was discovered
+        self._eod_checked: date | None = None  # US/Eastern day the date was discovered
 
     async def start(self, tickers: list[str]) -> None:
         # retries=0: the poll loop is the retry; client retries waste free-tier quota
@@ -179,9 +193,10 @@ class MassiveDataSource(MarketDataSource):
         """Latest end-of-day close per tracked ticker. Runs in a thread.
 
         Discovers the latest trading date (walking back over weekends/holidays)
-        at most once per UTC day; other polls cost a single call.
+        at most once per US/Eastern day; other polls cost a single call. Each
+        close is quoted at its session's 16:00 ET close.
         """
-        today = datetime.now(UTC).date()
+        today = datetime.now(US_EASTERN).date()
         if self._eod_checked == today:
             bars = self._client.get_grouped_daily_aggs(self._eod_date.isoformat(), adjusted=True)
         else:
@@ -190,11 +205,8 @@ class MassiveDataSource(MarketDataSource):
                 return {}
             (self._eod_date, bars), self._eod_checked = found, today
         wanted = set(tickers)
-        return {
-            b.ticker: (b.close, b.timestamp / MS_PER_SECOND)
-            for b in bars
-            if b.ticker in wanted and b.close and b.timestamp
-        }
+        close_ts = session_close_ts(self._eod_date)
+        return {b.ticker: (b.close, close_ts) for b in bars if b.ticker in wanted and b.close}
 
     def _discover_eod(self, today: date) -> tuple[date, list] | None:
         """Most recent (date, bars), up to EOD_MAX_LOOKBACK_DAYS back, that has grouped bars."""
