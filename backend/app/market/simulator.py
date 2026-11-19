@@ -113,7 +113,7 @@ class GBMSimulator:
                     "up" if shock_sign > 0 else "down",
                 )
 
-            result[ticker] = round(self._prices[ticker], 2)
+            result[ticker] = self._prices[ticker]
 
         return result
 
@@ -240,7 +240,7 @@ class SimulatorDataSource(MarketDataSource):
         logger.info("Simulator stopped")
 
     async def add_ticker(self, ticker: str) -> None:
-        if self._sim:
+        if self._sim and ticker not in self._sim.get_tickers():
             self._sim.add_ticker(ticker)
             # Seed cache immediately so the ticker has a price right away
             price = self._sim.get_price(ticker)

@@ -1,5 +1,10 @@
 """Tests for PriceCache."""
 
+import math
+import time
+
+import pytest
+
 from app.market.cache import PriceCache
 
 
@@ -48,6 +53,15 @@ class TestPriceCache:
         """Test removing a ticker that doesn't exist."""
         cache = PriceCache()
         cache.remove("AAPL")  # Should not raise
+        assert cache.version == 0
+
+    def test_remove_bumps_version(self):
+        """Removal is a change that SSE clients must see."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        version = cache.version
+        cache.remove("AAPL")
+        assert cache.version == version + 1
 
     def test_get_all(self):
         """Test getting all prices."""
@@ -96,8 +110,43 @@ class TestPriceCache:
         update = cache.update("AAPL", 190.50, timestamp=custom_ts)
         assert update.timestamp == custom_ts
 
-    def test_price_rounding(self):
-        """Test that prices are rounded to 2 decimal places."""
+    def test_price_not_rounded(self):
+        """Prices are stored unrounded; sub-cent prices survive."""
         cache = PriceCache()
-        update = cache.update("AAPL", 190.12345)
-        assert update.price == 190.12
+        assert cache.update("AAPL", 190.12345).price == 190.12345
+        assert cache.update("PENNY", 0.001).price == 0.001
+
+    @pytest.mark.parametrize("price", [0.0, -1.0, math.nan, math.inf, 2e9])
+    def test_invalid_price_rejected(self, price):
+        """Invalid prices are rejected without replacing the prior quote or bumping version."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0, timestamp=100.0)
+        version = cache.version
+        assert cache.update("AAPL", price, timestamp=101.0) is None
+        assert cache.get_price("AAPL") == 190.0
+        assert cache.version == version
+
+    @pytest.mark.parametrize("timestamp", [math.nan, math.inf, time.time() + 60])
+    def test_invalid_timestamp_rejected(self, timestamp):
+        """Non-finite and far-future timestamps are rejected."""
+        cache = PriceCache()
+        assert cache.update("AAPL", 190.0, timestamp=timestamp) is None
+        assert "AAPL" not in cache
+
+    def test_older_quote_does_not_overwrite_newer(self):
+        """A quote older than the cached one is rejected."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0, timestamp=200.0)
+        assert cache.update("AAPL", 180.0, timestamp=100.0) is None
+        assert cache.get_price("AAPL") == 190.0
+
+    def test_same_timestamp_refetch_accepted(self):
+        """Re-fetching the same source quote is accepted."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0, timestamp=200.0)
+        assert cache.update("AAPL", 190.0, timestamp=200.0) is not None
+
+    def test_zero_timestamp_kept(self):
+        """An explicit timestamp of 0.0 is not replaced with wall time."""
+        cache = PriceCache()
+        assert cache.update("AAPL", 190.0, timestamp=0.0).timestamp == 0.0
