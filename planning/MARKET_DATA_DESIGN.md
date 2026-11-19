@@ -859,7 +859,7 @@ API reference: `MASSIVE_API.md`. Facts checked against the installed `massive` 2
 
 - `RESTClient(api_key, connect_timeout, read_timeout, retries, ...)` is **synchronous** (urllib3).
 - `get_snapshot_all(market_type, tickers=None, ...) -> list[TickerSnapshot]`. **With `tickers` empty or None, the call returns every US stock** (~10k), so never call it with an empty list.
-- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The current code reads `snap.last_trade.timestamp`, gets `AttributeError` on every snapshot, and logs it as a skip, so **the current Massive source never writes a price.**
+- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The code used to read `snap.last_trade.timestamp`, which failed on every snapshot so no price was ever written. **Fixed 2026-11-19** (reads `sip_timestamp / 1e9`); the full fallback chain below is still to do.
 - `MinuteSnapshot.close` / `.timestamp` (milliseconds); `Agg.close` for `day`; `TickerSnapshot.updated` (nanoseconds).
 - `get_grouped_daily_aggs(date, adjusted=...) -> list[GroupedDailyAgg]` with `ticker`, `close`, `timestamp` (ms).
 - Non-200 responses raise `massive.exceptions.BadResponse(body_text)`. The status code is not an attribute, so a plan restriction is detected by `"NOT_AUTHORIZED"` in `str(exc)`.

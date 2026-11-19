@@ -13,6 +13,8 @@ from .interface import MarketDataSource
 
 logger = logging.getLogger(__name__)
 
+NS_PER_SECOND = 1_000_000_000
+
 
 class MassiveDataSource(MarketDataSource):
     """MarketDataSource backed by the Massive (Polygon.io) REST API.
@@ -99,8 +101,9 @@ class MassiveDataSource(MarketDataSource):
             for snap in snapshots:
                 try:
                     price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
+                    # LastTrade has no `timestamp` attribute: the trade time is
+                    # `sip_timestamp`, in Unix nanoseconds → convert to seconds.
+                    timestamp = snap.last_trade.sip_timestamp / NS_PER_SECOND
                     self._cache.update(
                         ticker=snap.ticker,
                         price=price,

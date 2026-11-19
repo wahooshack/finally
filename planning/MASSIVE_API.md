@@ -101,7 +101,7 @@ Unknown or untraded symbols are left out of the response; no error is raised. Sn
 | `todaysChangePerc` | `snap.todays_change_percent` | `float` |
 | `updated` | `snap.updated` | `int` ns |
 
-> **Gotcha (affects the current code):** `LastTrade` has **no** `timestamp` attribute. The trade time is `sip_timestamp`, in nanoseconds. Reproduced with the installed 2.2.0 package:
+> **Gotcha (fixed 2026-11-19):** `LastTrade` has **no** `timestamp` attribute. The trade time is `sip_timestamp`, in nanoseconds. Reproduced with the installed 2.2.0 package:
 >
 > ```
 > >>> s = TickerSnapshot.from_dict({"ticker":"X","lastTrade":{"p":20.5,"t":1605192894630916600}})
@@ -109,7 +109,7 @@ Unknown or untraded symbols are left out of the response; no error is raised. Sn
 > >>> s.last_trade.timestamp       # AttributeError
 > ```
 >
-> `backend/app/market/massive_client.py` reads `snap.last_trade.timestamp / 1000.0`. That raises `AttributeError` for every ticker, which is caught and logged as a skip, so **the Massive source currently never writes a price**. The fix is in MARKET_INTERFACE.md section 6.
+> `backend/app/market/massive_client.py` used to read `snap.last_trade.timestamp / 1000.0`, which raised `AttributeError` for every ticker, so the Massive source never wrote a price. It now reads `sip_timestamp / 1e9`, and `tests/market/test_massive.py` builds real `TickerSnapshot` objects so the attribute names are checked.
 
 ### 3.4 Extracting a price and source time
 
