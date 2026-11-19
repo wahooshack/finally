@@ -1,0 +1,254 @@
+# Massive API Reference (formerly Polygon.io)
+
+Reference for the parts of the Massive REST API that FinAlly uses to fetch real-time and end-of-day (EOD) US stock prices for many tickers at once.
+
+- Base URL: `https://api.massive.com` (the legacy `api.polygon.io` host still works)
+- Python client: `massive` on PyPI (this project locks **2.2.0**), `from massive import RESTClient`
+- Docs: https://massive.com/docs/rest/stocks/overview
+- Verified on 2026-11-18 against Context7 docs (`/massive-com/client-python`, `/llmstxt/massive_llms_txt`) and the installed package source.
+
+## 1. Authentication and client setup
+
+You can pass the API key as the `apiKey` query parameter or as an `Authorization: Bearer <key>` header. The Python client handles this for you:
+
+```python
+from massive import RESTClient
+
+client = RESTClient(
+    api_key=os.environ["MASSIVE_API_KEY"],
+    connect_timeout=5.0,
+    read_timeout=10.0,
+    retries=0,   # our poll loop is the retry; see section 6
+)
+```
+
+`RESTClient.__init__` signature (2.2.0): `api_key=None, connect_timeout=10.0, read_timeout=10.0, num_pools=10, retries=3, base="https://api.massive.com", pagination=True, verbose=False, trace=False, custom_json=None`.
+
+**The client is synchronous** (urllib3). In FastAPI, call it with `await asyncio.to_thread(...)` so it does not block the event loop.
+
+## 2. Plans, data freshness and rate limits
+
+Plans change; check https://massive.com/pricing before relying on these.
+
+| Plan (Stocks) | Price | Calls | Recency | Snapshot | `lastTrade` in snapshot | `lastQuote` |
+|---|---|---|---|---|---|---|
+| Basic | Free | 5 / minute | End of day | Not included | No | No |
+| Starter | Paid | Unlimited | 15-min delayed | Yes | No | No |
+| Developer | Paid | Unlimited | 15-min delayed | Yes | Yes | No |
+| Advanced | Paid | Unlimited | Real-time | Yes | Yes | Yes |
+| Business | Paid | Unlimited | Real-time | Yes | Yes | Yes (+ `fmv`) |
+
+What this means for FinAlly:
+
+- **Every snapshot field is optional.** `lastTrade` is returned only on plans that include trades, so the price must come from a fallback chain (section 3.3).
+- **Free keys cannot use snapshots.** On Basic, use grouped daily bars (section 4.1): one call returns the EOD close for every US stock.
+- "Unlimited" plans still advise staying under ~100 requests/second. One snapshot call per 2–15 s is far below that.
+
+## 3. Real-time prices: snapshot for many tickers
+
+### 3.1 Endpoint
+
+`GET /v2/snapshot/locale/us/markets/stocks/tickers?tickers=AAPL,MSFT,TSLA`
+
+| Query param | Notes |
+|---|---|
+| `tickers` | Comma-separated, **case-sensitive**. If omitted, returns all ~10,000 tickers. |
+| `include_otc` | Default `false`. |
+
+Unknown or untraded symbols are left out of the response; no error is raised. Snapshot data is cleared daily around 3:30 AM ET and fills in again from about 4:00 AM ET, so `day` may be empty early in the morning.
+
+### 3.2 Response
+
+```json
+{
+  "status": "OK",
+  "count": 1,
+  "tickers": [{
+    "ticker": "AAPL",
+    "day":     {"o": 189.1, "h": 191.0, "l": 188.7, "c": 190.4, "v": 51234567, "vw": 190.02},
+    "min":     {"o": 190.3, "h": 190.5, "l": 190.2, "c": 190.45, "v": 120000, "vw": 190.4,
+                "av": 51234567, "n": 812, "t": 1763305140000},
+    "prevDay": {"o": 187.9, "h": 189.5, "l": 187.2, "c": 189.0, "v": 48000000, "vw": 188.6},
+    "lastTrade": {"p": 190.5, "s": 100, "x": 4, "c": [14, 41], "i": "71675577320245",
+                  "t": 1763305159123456789},
+    "lastQuote": {"p": 190.49, "s": 3, "P": 190.51, "S": 2, "t": 1763305159223456789},
+    "todaysChange": 1.5,
+    "todaysChangePerc": 0.794,
+    "updated": 1763305159123456789
+  }]
+}
+```
+
+**Timestamp units differ by field:**
+
+| Field | Unit |
+|---|---|
+| `lastTrade.t`, `lastQuote.t`, `updated` | **Nanoseconds** since the Unix epoch |
+| `min.t` and aggregate bar `t` | **Milliseconds** since the Unix epoch |
+
+### 3.3 Python client mapping
+
+`client.get_snapshot_all("stocks", tickers=[...])` returns `list[TickerSnapshot]`. JSON keys map to snake_case attributes:
+
+| JSON | Python attribute | Type |
+|---|---|---|
+| `ticker` | `snap.ticker` | `str` |
+| `lastTrade.p` / `.t` | `snap.last_trade.price` / `snap.last_trade.sip_timestamp` | `float` / `int` ns |
+| `lastQuote.p` / `.P` / `.t` | `snap.last_quote.bid_price` / `.ask_price` / `.sip_timestamp` | `float` / `int` ns |
+| `min.c` / `.t` | `snap.min.close` / `snap.min.timestamp` | `float` / `int` ms |
+| `day.c` | `snap.day.close` | `float` |
+| `prevDay.c` | `snap.prev_day.close` | `float` |
+| `todaysChangePerc` | `snap.todays_change_percent` | `float` |
+| `updated` | `snap.updated` | `int` ns |
+
+> **Gotcha (affects the current code):** `LastTrade` has **no** `timestamp` attribute. The trade time is `sip_timestamp`, in nanoseconds. Reproduced with the installed 2.2.0 package:
+>
+> ```
+> >>> s = TickerSnapshot.from_dict({"ticker":"X","lastTrade":{"p":20.5,"t":1605192894630916600}})
+> >>> s.last_trade.sip_timestamp   # 1605192894630916600
+> >>> s.last_trade.timestamp       # AttributeError
+> ```
+>
+> `backend/app/market/massive_client.py` reads `snap.last_trade.timestamp / 1000.0`. That raises `AttributeError` for every ticker, which is caught and logged as a skip, so **the Massive source currently never writes a price**. The fix is in MARKET_INTERFACE.md section 6.
+
+### 3.4 Extracting a price and source time
+
+Use the freshest field the plan provides:
+
+```python
+from massive.rest.models import TickerSnapshot
+
+NS, MS = 1e9, 1e3
+
+def extract_quote(snap: TickerSnapshot) -> tuple[float, float] | None:
+    """Return (price, quoted_at_unix_seconds) from a snapshot, or None."""
+    lt = snap.last_trade
+    if lt and lt.price and lt.sip_timestamp:
+        return lt.price, lt.sip_timestamp / NS
+    m = snap.min
+    if m and m.close and m.timestamp:
+        return m.close, m.timestamp / MS
+    if snap.day and snap.day.close and snap.updated:
+        return snap.day.close, snap.updated / NS
+    return None
+```
+
+`prevDay.c` is yesterday's close. Do not use it as a live price. It is useful as a reference value only.
+
+### 3.5 Complete example
+
+```python
+import asyncio, os
+from massive import RESTClient
+from massive.rest.models import SnapshotMarketType
+
+client = RESTClient(api_key=os.environ["MASSIVE_API_KEY"], retries=0)
+
+async def fetch_prices(tickers: list[str]) -> dict[str, tuple[float, float]]:
+    snaps = await asyncio.to_thread(
+        client.get_snapshot_all, SnapshotMarketType.STOCKS, tickers
+    )
+    out = {}
+    for snap in snaps:
+        q = extract_quote(snap)
+        if q:
+            out[snap.ticker] = q
+    return out
+
+print(asyncio.run(fetch_prices(["AAPL", "MSFT", "NVDA"])))
+# {'AAPL': (190.5, 1763305159.123), 'MSFT': (...), 'NVDA': (...)}
+```
+
+### 3.6 Single ticker (not used for polling)
+
+```python
+snap = client.get_snapshot_ticker("stocks", "AAPL")   # GET /v2/snapshot/locale/us/markets/stocks/tickers/AAPL
+trade = client.get_last_trade("AAPL")                 # GET /v2/last/trade/AAPL  (Developer+)
+```
+
+Each of these is one call per ticker, so they do not suit the 5 calls/min Basic limit. Always batch with `get_snapshot_all`.
+
+## 4. End-of-day prices
+
+### 4.1 Grouped daily: all tickers, one call (works on Basic)
+
+`GET /v2/aggs/grouped/locale/us/market/stocks/{YYYY-MM-DD}?adjusted=true`
+
+```python
+from datetime import date, timedelta
+
+def latest_eod(client: RESTClient, tickers: set[str], max_back: int = 5) -> dict[str, tuple[float, float]]:
+    """Most recent EOD close per ticker as (close, bar_time_seconds).
+
+    Walks back from yesterday over weekends and holidays, up to max_back days.
+    """
+    day = date.today() - timedelta(days=1)
+    for _ in range(max_back):
+        bars = client.get_grouped_daily_aggs(day.isoformat(), adjusted=True)
+        if bars:
+            return {b.ticker: (b.close, b.timestamp / 1000) for b in bars if b.ticker in tickers}
+        day -= timedelta(days=1)
+    return {}
+```
+
+`GroupedDailyAgg` fields: `ticker` (`T`), `open`, `high`, `low`, `close`, `volume`, `vwap`, `timestamp` (ms), `transactions`, `otc`. The response covers about 10k tickers (several MB), so filter it client-side. If the date has no session (weekend or holiday), the result list is empty.
+
+### 4.2 Previous close: one ticker
+
+`GET /v2/aggs/ticker/{ticker}/prev`
+
+```python
+bars = client.get_previous_close_agg("AAPL")   # list[PreviousCloseAgg]
+close, t_ms = bars[0].close, bars[0].timestamp
+```
+
+### 4.3 Daily open/close for a date: one ticker
+
+`GET /v1/open-close/{ticker}/{date}`
+
+```python
+oc = client.get_daily_open_close_agg("AAPL", "2026-11-16")
+oc.open, oc.close, oc.high, oc.low, oc.pre_market, oc.after_hours, oc.volume
+```
+
+### 4.4 Historical bars (charts or backfill)
+
+`GET /v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to}`
+
+```python
+for bar in client.list_aggs("AAPL", 1, "day", "2026-10-01", "2026-11-16", limit=50000):
+    print(bar.timestamp, bar.close)    # timestamp in ms; the iterator auto-paginates
+```
+
+FinAlly has no price-history endpoint, so this is reference only.
+
+## 5. Errors
+
+| Situation | HTTP | Client raises |
+|---|---|---|
+| Missing key | — | `massive.exceptions.AuthError` at construction |
+| Invalid key | 401 | `massive.exceptions.BadResponse` (body JSON in `str(e)`) |
+| Endpoint not in plan | 403 `NOT_AUTHORIZED` | `BadResponse` |
+| Rate limited | 429 | Retried by urllib3 when `retries > 0`, then `urllib3.exceptions.MaxRetryError` |
+| 5xx | 500/502/503/504 | Retried the same way |
+| Network / timeout | — | `urllib3` exceptions |
+
+```python
+from massive.exceptions import BadResponse
+
+try:
+    snaps = client.get_snapshot_all("stocks", ["AAPL"])
+except BadResponse as e:
+    if "NOT_AUTHORIZED" in str(e):
+        ...  # plan lacks snapshots, so switch to grouped-daily EOD (section 4.1)
+    raise
+```
+
+## 6. Polling guidance for FinAlly
+
+- **One batched snapshot call per cycle** for the whole tracked set (watchlist plus positions).
+- **Interval:** 15 s on Basic/EOD mode (fits 5 calls/min); 2–5 s on paid plans. The backend's freshness rule (fetch age at most 60 s) tolerates either.
+- **`retries=0`:** the poll loop is already the retry, and urllib3 retries on 429 waste free-tier quota and hide failures from `feed_status`.
+- **Quote time:** use the source timestamp converted to seconds as `quoted_at`. The 15-minute delay on Starter/Developer is visible as source age; it does not make the quote invalid.
+- **Missing tickers:** a requested symbol absent from the response is a per-ticker failure. Do not advance that ticker's `fetched_at`.
+- **Plan detection:** a 403 on snapshots means the key is Basic. Fall back to grouped daily EOD and log the mode once. EOD closes become stale for trading after 24 hours (PLAN section 6), which is the intended behavior.
