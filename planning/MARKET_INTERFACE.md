@@ -2,7 +2,9 @@
 
 The unified Python API FinAlly uses for stock prices. It uses Massive when `MASSIVE_API_KEY` is set and the built-in simulator otherwise. The rest of the backend never knows which one is running.
 
-The design keeps the existing structure in `backend/app/market/` and adds the changes required by PLAN.md section 6: unrounded prices, `quoted_at` and `fetched_at`, the session baseline, freshness, feed status, an injectable clock, and a per-call stream router. API details are in MASSIVE_API.md; simulator internals are in MARKET_SIMULATOR.md.
+The design keeps the existing structure in `backend/app/market/` and adds the changes required by PLAN.md section 6: unrounded prices, `quoted_at` and `fetched_at`, the session baseline, freshness, feed status, an injectable clock, and a per-call stream router. API details are in MASSIVE_API.md; simulator internals are in MARKET_SIMULATOR.md. MARKET_DATA_DESIGN.md is the full spec with complete code; where the two differ, that doc wins.
+
+**Status (2026-11-19):** the items marked **Done** below are in the code (99 tests pass). Everything else is still design.
 
 ## 1. Shape
 
@@ -33,14 +35,14 @@ Rules:
 
 | File | Contents | Change |
 |---|---|---|
-| `models.py` | `PriceUpdate` | Add `quoted_at`, `fetched_at`; drop rounding |
-| `freshness.py` | Limits, `is_valid_quote`, `quote_status` | **New** |
-| `cache.py` | `PriceCache` | Clock, session, baselines, validation |
+| `models.py` | `PriceUpdate` | Add `quoted_at`, `fetched_at`; drop rounding of `change` |
+| `freshness.py` | Limits, `is_valid_quote`, `quote_status` | **New**. `is_valid_quote` is **Done** but currently lives in `cache.py`; move it here with `quote_status`. |
+| `cache.py` | `PriceCache` | Clock, session, baselines. **Done:** validation, unrounded prices, out-of-order rejection, removal bumps `version`. |
 | `interface.py` | `MarketDataSource` ABC | Add `market_mode`, `feed_status`, `reconcile` |
-| `simulator.py` | `GBMSimulator`, `SimulatorDataSource` | No rounding; stamps tick time |
-| `massive_client.py` | `MassiveDataSource` | Fix timestamp bug; price fallback; feed status; EOD mode |
+| `simulator.py` | `GBMSimulator`, `SimulatorDataSource` | Stamps tick time. **Done:** no rounding, duplicate `add_ticker` is a no-op. |
+| `massive_client.py` | `MassiveDataSource` | Feed status. **Done:** timestamp bug, price fallback, EOD mode, `retries=0`, non-blocking `start()`, removed-during-poll guard. |
 | `factory.py` | `create_market_data_source` | Pass-through only |
-| `stream.py` | `create_stream_router` | Router built inside the factory; `feed_status` event; heartbeat |
+| `stream.py` | `create_stream_router` | `feed_status` event; heartbeat. **Done:** router built per call, empty map sent, strict JSON. |
 | `seed_prices.py` | Simulator constants | Unchanged |
 
 ## 3. Models and freshness
@@ -251,39 +253,47 @@ The app calls `reconcile()` at startup, after each committed mutation, and every
 | Source | `starting` | `healthy` | `degraded` |
 |---|---|---|---|
 | Simulator | Before `start()` | After `start()` | Never in normal operation; set if `step()` raises |
-| Massive | Before the first poll succeeds | Last poll succeeded | Last poll failed (network, 401/403/429/5xx), or a tracked ticker is missing from a successful response |
+| Massive | Before the first poll succeeds | Last poll succeeded, even if some tickers were missing from it | Last poll failed (network, 401/403/429/5xx) |
 
-A failed poll leaves cached prices alone. They age into `stale` on their own through the clock.
+A failed poll leaves cached prices alone. They age into `stale` on their own through the clock. A ticker missing from a successful response (for example a mistyped symbol) shows as `unavailable` or `stale` per ticker and does not degrade the whole feed (MARKET_DATA_DESIGN.md §16).
 
-## 6. `MassiveDataSource` changes
+## 6. `MassiveDataSource`
 
-Replace the parsing in `_poll_once` (the current `snap.last_trade.timestamp / 1000.0` raises `AttributeError` for every snapshot, as shown in MASSIVE_API.md section 3.3):
+**Done (2026-11-19):**
+- The timestamp bug is fixed (`sip_timestamp / 1e9`; MASSIVE_API.md section 3.3).
+- `extract_quote()` falls back from the last trade to the minute bar to today's bar, and never uses yesterday's close (MASSIVE_API.md 3.4).
+- Each poll captures the ticker list before the request and writes results only for tickers still tracked when it returns.
+- On a 403 `NOT_AUTHORIZED` (free Basic key), the source switches once to EOD mode with grouped daily bars, discovering the session date once per day (MASSIVE_API.md 4.1). The switch is logged once.
+- `RESTClient(api_key, retries=0)`: the poll loop is the retry.
+- `start()` does not await the first poll. It runs inside the polling task, so `stop()` also cancels an in-flight first poll.
+- The default interval stays 15 s and can be overridden by the constructor argument.
+
+**Still to do:**
+- feed status, with `self._status` set as in §5.1
+- `market_mode = "massive"`
+- EOD polling every 30 s instead of 60 s, and EOD `quoted_at` at the 16:00 ET close (MARKET_DATA_DESIGN.md §10.2)
+
+Target shape of the poll once feed status is added:
 
 ```python
 async def _poll_once(self) -> None:
     """Fetch one batched snapshot and write valid quotes to the cache."""
-    tickers = list(self._tickers)
+    tickers = list(self._tickers)  # immutable request set
     if not tickers:
         self._status = "healthy"
         return
     try:
-        snaps = await asyncio.to_thread(self._fetch, tickers)
+        quotes = await asyncio.to_thread(self._fetch, tickers)
     except Exception as e:
         logger.error("Massive poll failed: %s", e)
         self._status = "degraded"
         return
-    seen = set()
-    for snap in snaps:
-        quote = extract_quote(snap)   # MASSIVE_API.md 3.4
-        if quote and self._cache.update(snap.ticker, *quote):
-            seen.add(snap.ticker)
-    self._status = "healthy" if seen >= set(tickers) else "degraded"
+    current = set(self._tickers)  # skip tickers removed while the fetch was in flight
+    for ticker, quote in quotes.items():
+        if ticker in current:
+            self._cache.update(ticker, *quote)
+    self._status = "healthy"
 ```
-
-- `self._fetch` calls `get_snapshot_all` normally. On a 403 `NOT_AUTHORIZED` (free Basic key), switch once to EOD mode: `latest_eod()` with grouped daily bars (MASSIVE_API.md section 4.1), polled every 60 s. The switch is logged once.
-- Construct `RESTClient(api_key, retries=0)`. The poll loop is the retry.
-- Default interval stays 15 s and can be overridden by the constructor argument.
-- `market_mode = "massive"`.
 
 ## 7. Factory (`factory.py`)
 

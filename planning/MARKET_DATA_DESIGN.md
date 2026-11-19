@@ -2,7 +2,16 @@
 
 Implementation spec for everything in `backend/app/market/`: the unified API, the GBM simulator, the Massive (Polygon.io) client, the SSE stream, and the glue the rest of the backend uses. It turns PLAN.md section 6 (and the market parts of sections 7, 8 and 12) into code.
 
-**Status:** Design. The core subsystem exists and its 73 tests pass (checked 2026-11-19 with `uv run --extra dev pytest`). This document specifies the changes needed to meet the current PLAN.
+**Status:** Design, partly implemented. The core subsystem exists and its 99 tests pass (checked 2026-11-19 with `uv run --extra dev pytest`). The seven fixes from `MARKET_DATA_REVIEW.md` are in the code:
+- quote validation and unrounded prices
+- the §10.1 price fallback chain and EOD mode
+- ignoring tickers removed during a poll
+- non-blocking Massive `start()`
+- a router per `create_stream_router()` call
+- publishing removals to the stream
+- duplicate simulator adds as a no-op
+
+Everything else here is still to do, including the clock, freshness, `quoted_at`/`fetched_at`, the baseline, feed status, the service and the stream rewrite. Two EOD details also still differ in the code (§10.2). See `MARKET_DATA_SUMMARY.md` for the current state.
 
 **Related docs**
 
@@ -112,7 +121,7 @@ Rules:
 | `interface.py` | `MarketDataSource`, `FeedStatus`, `MarketMode` | Changed: `market_mode`, `feed_status` |
 | `seed_prices.py` | Simulator constants | Unchanged |
 | `simulator.py` | `GBMSimulator`, `SimulatorDataSource` | Changed: RNG injection, no rounding, clock, status |
-| `massive_client.py` | `MassiveDataSource`, `extract_quote`, `latest_eod` | Changed: timestamp bug fix, fallback chain, EOD mode, status |
+| `massive_client.py` | `MassiveDataSource`, `extract_quote`, `find_eod_session`, `eod_quotes` | Changed: timestamp bug fix, fallback chain, EOD mode, status |
 | `scripted.py` | `ScriptedDataSource` | **New** (test support) |
 | `factory.py` | `create_market_data_source` | Minor change |
 | `service.py` | `MarketData`, `ExecutionQuote`, `QuoteRejected`, `normalize_ticker` | **New** |
@@ -859,7 +868,7 @@ API reference: `MASSIVE_API.md`. Facts checked against the installed `massive` 2
 
 - `RESTClient(api_key, connect_timeout, read_timeout, retries, ...)` is **synchronous** (urllib3).
 - `get_snapshot_all(market_type, tickers=None, ...) -> list[TickerSnapshot]`. **With `tickers` empty or None, the call returns every US stock** (~10k), so never call it with an empty list.
-- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The code used to read `snap.last_trade.timestamp`, which failed on every snapshot so no price was ever written. **Fixed 2026-11-19** (reads `sip_timestamp / 1e9`); the full fallback chain below is still to do.
+- `LastTrade` has `price` and `sip_timestamp` (nanoseconds). There is **no** `timestamp` attribute. The code used to read `snap.last_trade.timestamp`, which failed on every snapshot so no price was ever written. **Fixed 2026-11-19** (reads `sip_timestamp / 1e9`). The §10.1 fallback chain (`extract_quote`) and EOD mode are implemented too, with the two gaps listed in §10.2.
 - `MinuteSnapshot.close` / `.timestamp` (milliseconds); `Agg.close` for `day`; `TickerSnapshot.updated` (nanoseconds).
 - `get_grouped_daily_aggs(date, adjusted=...) -> list[GroupedDailyAgg]` with `ticker`, `close`, `timestamp` (ms).
 - Non-200 responses raise `massive.exceptions.BadResponse(body_text)`. The status code is not an attribute, so a plan restriction is detected by `"NOT_AUTHORIZED"` in `str(exc)`.
@@ -877,10 +886,17 @@ Use the freshest field the plan provides, in this order:
 
 ### 10.2 EOD mode (free Basic keys)
 
-Basic keys get a 403 `NOT_AUTHORIZED` on snapshots. On the first such response, the source switches permanently (for that process) to **EOD mode**. Each poll then makes one `get_grouped_daily_aggs` call for the most recent session that has data, walking back from today (US/Eastern) over weekends and holidays.
+Basic keys get a 403 `NOT_AUTHORIZED` on snapshots. On the first such response, the source switches permanently (for that process) to **EOD mode**, polling `get_grouped_daily_aggs`.
 
+- **Discover the session date once per day, not on every poll.** Walk back from today (US/Eastern) over weekends and holidays to the most recent date with bars, then cache that date. Later polls that day cost **one call** for the cached date. Walking back on every poll would cost up to 3 calls per poll over a weekend, which breaks the 5 calls/min budget (found in `MARKET_DATA_REVIEW.md`). Discovery reuses the bars it found, so it costs no extra call. If discovery finds nothing, the date is not cached and the next poll tries again.
 - `quoted_at` for an EOD bar is that session's **16:00 America/New_York close**. The bar's own `t` is the start of the day window, which would overstate its age by 16 hours.
-- The EOD poll interval is 30 s. That is 2 calls/min (within the 5/min limit) and keeps `fetched_at` under the 60 s limit even if one poll fails.
+- The EOD poll interval is 30 s. That is 2 calls/min (within the 5/min limit) and keeps `fetched_at` under the 60 s limit even if one poll fails. On a discovery poll, the first-403 probe plus a walk-back can reach about 5 calls in one minute. A resulting 429 is just a failed poll, retried on the next cycle.
+
+**Implementation gaps (code as of 2026-11-19):**
+1. `EOD_POLL_INTERVAL` is 60 s, not 30 s.
+2. `quoted_at` is the bar's `t`, not the 16:00 ET close, and `today` is a UTC date.
+
+Both need fixing together with freshness (step 4 of §19); until freshness exists, neither changes observable behavior. Gap 2 also needs the `tzdata` dependency.
 - The PLAN's 24 h source-age limit makes EOD closes stale from 16:00 ET the next day until the next close publishes. Over a weekend, Friday's close is stale. **This is intended** (PLAN §6: "reject old closed-market quotes after 24 hours"). Prices still display, marked stale, and trading is disabled.
 
 ### 10.3 Code
@@ -931,20 +947,25 @@ def session_close_ts(day: date) -> float:
     return datetime.combine(day, SESSION_CLOSE, tzinfo=US_EASTERN).timestamp()
 
 
-def latest_eod(client: RESTClient, tickers: set[str], today: date, max_back: int = 7) -> dict[str, Quote]:
-    """Most recent EOD close per requested ticker, walking back over non-trading days.
+def find_eod_session(client: RESTClient, today: date, max_back: int = 7) -> tuple[date, list] | None:
+    """Most recent (date, bars) with grouped bars, walking back over non-trading days.
 
     Synchronous; call it in a worker thread. Today's bars are tried first, since
-    they exist after the close.
+    they exist after the close. Call once per day and cache the date (§10.2).
     """
     day = today
     for _ in range(max_back):
         bars = client.get_grouped_daily_aggs(day.isoformat(), adjusted=True)
         if bars:
-            close_ts = session_close_ts(day)
-            return {b.ticker: (float(b.close), close_ts) for b in bars if b.ticker in tickers and b.close}
+            return day, bars
         day -= timedelta(days=1)
-    return {}
+    return None
+
+
+def eod_quotes(bars: list, day: date, tickers: set[str]) -> dict[str, Quote]:
+    """EOD close per requested ticker, quoted at the 16:00 ET session close."""
+    close_ts = session_close_ts(day)
+    return {b.ticker: (float(b.close), close_ts) for b in bars if b.ticker in tickers and b.close}
 
 
 def _is_not_authorized(exc: Exception) -> bool:
@@ -980,6 +1001,8 @@ class MassiveDataSource(MarketDataSource):
         self._task: asyncio.Task[None] | None = None
         self._status: FeedStatus = "starting"
         self._eod_mode = False
+        self._eod_day: date | None = None  # cached session date (§10.2)
+        self._eod_checked: date | None = None  # the day that date was discovered
         self._missing: frozenset[str] = frozenset()
 
     # --- interface ----------------------------------------------------------
@@ -1076,7 +1099,14 @@ class MassiveDataSource(MarketDataSource):
         """Synchronous provider call; runs in a worker thread."""
         if self._eod_mode:
             today = datetime.fromtimestamp(self._cache.now(), US_EASTERN).date()
-            return latest_eod(self._client, set(tickers), today)
+            if self._eod_checked == today:  # one call per poll
+                bars = self._client.get_grouped_daily_aggs(self._eod_day.isoformat(), adjusted=True)
+            else:  # discovery, at most once per day; retried next poll if nothing found
+                found = find_eod_session(self._client, today)
+                if found is None:
+                    return {}
+                (self._eod_day, bars), self._eod_checked = found, today
+            return eod_quotes(bars, self._eod_day, set(tickers))
         snaps = self._client.get_snapshot_all(SnapshotMarketType.STOCKS, tickers=sorted(tickers))
         out: dict[str, Quote] = {}
         for snap in snaps:
@@ -1816,10 +1846,11 @@ Because the clock is manual, wall time does not age quotes in E2E. Tests advance
 
 | Topic | Decision | Why |
 |---|---|---|
-| Massive `start()` | Does not await the first poll; feed stays `starting` until it completes | Startup and requests never block on the provider (PLAN §6). The current code awaits the first poll. |
+| Massive `start()` | Does not await the first poll; feed stays `starting` until it completes | Startup and requests never block on the provider (PLAN §6). Also lets `stop()` cancel an in-flight first poll. Implemented 2026-11-19. |
 | Missing symbol in a successful Massive response | Feed stays `healthy`; the ticker is `unavailable`/`stale` and listed in `missing_tickers()` | A single mistyped watchlist symbol should not show the whole feed as degraded. Per-ticker status already shows the problem. (`MARKET_INTERFACE.md` §5.1 said `degraded`.) |
 | EOD `quoted_at` | 16:00 ET session close, not the bar's window start | The bar `t` is midnight ET, which overstates age by 16 h and would make every EOD close stale on arrival. |
-| EOD poll interval | 30 s | Below the 60 s fetch-age limit with room for one failed poll, and 2 calls/min fits the 5/min limit. |
+| EOD poll interval | 30 s | Below the 60 s fetch-age limit with room for one failed poll, and 2 calls/min fits the 5/min limit. (Code currently 60 s; see §10.2.) |
+| EOD session date | Discovered once per day and cached | Walking back on every poll exceeds the free 5 calls/min budget over weekends. |
 | Re-fetch of an unchanged quote | Advance `fetched_at` only; keep `previous_price` | Otherwise every Massive poll would reset `direction` to `flat` and kill the flash information. |
 | Out-of-order quote | Ignored, `fetched_at` unchanged | Never move a quote backward in source time. |
 | Reconcile owner | `MarketData`, reading the DB through a callable | Keeps SQL out of `market/` and makes the tracked set always match committed state. |
