@@ -59,6 +59,22 @@ class TestSimulatorDataSource:
 
         await source.stop()
 
+    async def test_add_existing_ticker_is_noop(self):
+        """Re-adding a tracked ticker does not republish it or reset its direction."""
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=60.0)
+        await source.start(["AAPL"])
+        cache.update("AAPL", cache.get_price("AAPL") + 1)  # an up tick
+        before = cache.get("AAPL")
+        version = cache.version
+
+        await source.add_ticker("AAPL")
+
+        assert cache.version == version
+        assert cache.get("AAPL") is before
+        assert source.get_tickers() == ["AAPL"]
+        await source.stop()
+
     async def test_remove_ticker(self):
         """Test removing a ticker."""
         cache = PriceCache()

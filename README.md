@@ -4,7 +4,7 @@ An AI-powered trading workstation: live streaming prices, a simulated $10k portf
 
 ## Status
 
-The market data subsystem (`backend/app/market/`) is complete. The rest of the platform is in development; see [planning/PLAN.md](planning/PLAN.md).
+The core market data subsystem (`backend/app/market/`) is built and tested; its quote-freshness work and the rest of the platform are in development. See [planning/MARKET_DATA_SUMMARY.md](planning/MARKET_DATA_SUMMARY.md) and [planning/PLAN.md](planning/PLAN.md).
 
 ## Features
 

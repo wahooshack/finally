@@ -113,7 +113,7 @@ Unknown or untraded symbols are left out of the response; no error is raised. Sn
 
 ### 3.4 Extracting a price and source time
 
-Use the freshest field the plan provides:
+Use the freshest field the plan provides. This is implemented as `extract_quote()` in `backend/app/market/massive_client.py`:
 
 ```python
 from massive.rest.models import TickerSnapshot
@@ -177,21 +177,31 @@ Each of these is one call per ticker, so they do not suit the 5 calls/min Basic 
 ```python
 from datetime import date, timedelta
 
-def latest_eod(client: RESTClient, tickers: set[str], max_back: int = 5) -> dict[str, tuple[float, float]]:
-    """Most recent EOD close per ticker as (close, bar_time_seconds).
+def find_eod_session(client: RESTClient, today: date, max_back: int = 5) -> tuple[date, list] | None:
+    """Most recent (date, bars) that has grouped bars, walking back over weekends/holidays.
 
-    Walks back from yesterday over weekends and holidays, up to max_back days.
+    Call this once per day and cache the date; it can cost several calls.
     """
-    day = date.today() - timedelta(days=1)
-    for _ in range(max_back):
+    for days_back in range(max_back):
+        day = today - timedelta(days=days_back)
         bars = client.get_grouped_daily_aggs(day.isoformat(), adjusted=True)
         if bars:
-            return {b.ticker: (b.close, b.timestamp / 1000) for b in bars if b.ticker in tickers}
-        day -= timedelta(days=1)
-    return {}
+            return day, bars
+    return None
+
+found = find_eod_session(client, date.today())        # discovery: up to max_back calls
+if found:
+    session_day, bars = found
+    closes = {b.ticker: b.close for b in bars if b.ticker in {"AAPL", "MSFT"}}
+    # Later polls the same day: one call for the cached date
+    bars = client.get_grouped_daily_aggs(session_day.isoformat(), adjusted=True)
 ```
 
 `GroupedDailyAgg` fields: `ticker` (`T`), `open`, `high`, `low`, `close`, `volume`, `vwap`, `timestamp` (ms), `transactions`, `otc`. The response covers about 10k tickers (several MB), so filter it client-side. If the date has no session (weekend or holiday), the result list is empty.
+
+**Cache the session date.** Walking back on every poll costs up to 3 calls per poll over a weekend, which breaks the free 5 calls/min limit.
+
+**Quote time for a close.** A daily bar's `t` marks the start of the day window, not the close. For the source time (`quoted_at`), use that session's 16:00 America/New_York close (needs `tzdata` on Windows). Otherwise the close looks 16 hours older than it is. See MARKET_DATA_DESIGN.md §10.2.
 
 ### 4.2 Previous close: one ticker
 
@@ -247,8 +257,8 @@ except BadResponse as e:
 ## 6. Polling guidance for FinAlly
 
 - **One batched snapshot call per cycle** for the whole tracked set (watchlist plus positions).
-- **Interval:** 15 s on Basic/EOD mode (fits 5 calls/min); 2–5 s on paid plans. The backend's freshness rule (fetch age at most 60 s) tolerates either.
+- **Interval:** snapshots every 15 s by default (2–5 s is fine on paid plans). In EOD mode, every 30 s with the session date cached (section 4.1). That is 2 calls/min, within the free 5 calls/min, and keeps fetch age under the 60 s freshness limit even if one poll fails. (The code currently uses 60 s; see MARKET_DATA_DESIGN.md §10.2.)
 - **`retries=0`:** the poll loop is already the retry, and urllib3 retries on 429 waste free-tier quota and hide failures from `feed_status`.
 - **Quote time:** use the source timestamp converted to seconds as `quoted_at`. The 15-minute delay on Starter/Developer is visible as source age; it does not make the quote invalid.
 - **Missing tickers:** a requested symbol absent from the response is a per-ticker failure. Do not advance that ticker's `fetched_at`.
-- **Plan detection:** a 403 on snapshots means the key is Basic. Fall back to grouped daily EOD and log the mode once. EOD closes become stale for trading after 24 hours (PLAN section 6), which is the intended behavior.
+- **Plan detection:** a 403 on snapshots means the key is Basic. Fall back to grouped daily EOD and log the mode once (implemented in `MassiveDataSource`). EOD closes become stale for trading after 24 hours (PLAN section 6), which is the intended behavior.

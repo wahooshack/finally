@@ -20,7 +20,7 @@ from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_
 - **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`, plus properties `change`, `change_percent`, `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization.
 
 - **`PriceCache`** — Thread-safe in-memory store. Key methods:
-  - `update(ticker, price, timestamp=None) -> PriceUpdate`
+  - `update(ticker, price, timestamp=None) -> PriceUpdate | None` — returns None (no change) for an invalid price, a non-finite/future timestamp, or a quote older than the cached one; prices are stored unrounded
   - `get(ticker) -> PriceUpdate | None`
   - `get_price(ticker) -> float | None`
   - `get_all() -> dict[str, PriceUpdate]`

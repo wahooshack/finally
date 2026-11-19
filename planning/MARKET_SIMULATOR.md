@@ -106,9 +106,13 @@ The split is deliberate. `GBMSimulator` is synchronous and deterministic given i
 
 The current simulator works; these changes align it with the quote lifecycle.
 
-### 4.1 No rounding
+### 4.1 No rounding (done 2026-11-19)
 
-`step()` currently returns `round(price, 2)`. Return the raw float and let the cache store it unrounded. The internal state `self._prices` is already unrounded.
+`step()` returns the raw float, and the cache stores it unrounded. Rounding is for display only.
+
+### 4.1a Duplicate add is a no-op (done 2026-11-19)
+
+`SimulatorDataSource.add_ticker()` returns early for a ticker that is already tracked. Republishing its price would bump the cache version and reset its up/down direction although nothing ticked.
 
 ### 4.2 Timestamps from the shared clock
 

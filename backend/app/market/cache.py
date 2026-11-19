@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+import math
 import time
 from threading import Lock
 
 from .models import PriceUpdate
+
+MAX_PRICE = 1e9
+MAX_FUTURE_SKEW = 5.0  # seconds a source timestamp may run ahead of the clock
+
+
+def is_valid_quote(price: float, timestamp: float, now: float) -> bool:
+    """True if a price/timestamp pair may enter the cache."""
+    return (
+        math.isfinite(price)
+        and 0 < price <= MAX_PRICE
+        and math.isfinite(timestamp)
+        and timestamp <= now + MAX_FUTURE_SKEW
+    )
 
 
 class PriceCache:
@@ -20,21 +34,26 @@ class PriceCache:
         self._lock = Lock()
         self._version: int = 0  # Monotonically increasing; bumped on every update
 
-    def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate:
-        """Record a new price for a ticker. Returns the created PriceUpdate.
+    def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate | None:
+        """Record a new price for a ticker. Returns the created PriceUpdate, or None if rejected.
 
-        Automatically computes direction and change from the previous price.
-        If this is the first update for the ticker, previous_price == price (direction='flat').
+        Rejects non-finite, non-positive or oversized prices, non-finite or future
+        timestamps, and quotes older than the cached one; a rejection leaves the cache
+        and version unchanged. Prices are stored unrounded. On the first update for a
+        ticker, previous_price == price (direction='flat').
         """
+        now = time.time()
+        ts = now if timestamp is None else timestamp
+        if not is_valid_quote(price, ts, now):
+            return None
         with self._lock:
-            ts = timestamp or time.time()
             prev = self._prices.get(ticker)
-            previous_price = prev.price if prev else price
-
+            if prev and ts < prev.timestamp:
+                return None
             update = PriceUpdate(
                 ticker=ticker,
-                price=round(price, 2),
-                previous_price=round(previous_price, 2),
+                price=price,
+                previous_price=prev.price if prev else price,
                 timestamp=ts,
             )
             self._prices[ticker] = update
@@ -57,9 +76,10 @@ class PriceCache:
         return update.price if update else None
 
     def remove(self, ticker: str) -> None:
-        """Remove a ticker from the cache (e.g., when removed from watchlist)."""
+        """Remove a ticker from the cache; bumps the version only if it was present."""
         with self._lock:
-            self._prices.pop(ticker, None)
+            if self._prices.pop(ticker, None) is not None:
+                self._version += 1
 
     @property
     def version(self) -> int:

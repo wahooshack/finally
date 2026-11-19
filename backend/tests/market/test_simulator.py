@@ -120,12 +120,8 @@ class TestGBMSimulator:
         """Test that default dt is a reasonable small value."""
         assert 0 < GBMSimulator.DEFAULT_DT < 0.0001
 
-    def test_prices_rounded_to_two_decimals(self):
-        """Test that prices are rounded to 2 decimal places."""
+    def test_prices_not_rounded(self):
+        """Step returns the raw simulated price; rounding is for display only."""
         sim = GBMSimulator(tickers=["AAPL"])
         result = sim.step()
-        price_str = str(result["AAPL"])
-        # Check that we have at most 2 decimal places
-        if '.' in price_str:
-            decimal_part = price_str.split('.')[1]
-            assert len(decimal_part) <= 2
+        assert result["AAPL"] == sim.get_price("AAPL")

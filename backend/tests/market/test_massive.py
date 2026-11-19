@@ -1,12 +1,16 @@
 """Tests for MassiveDataSource (mocked)."""
 
+import asyncio
+import threading
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
-from massive.rest.models import TickerSnapshot
+from massive.exceptions import BadResponse
+from massive.rest.models import GroupedDailyAgg, TickerSnapshot
 
 from app.market.cache import PriceCache
-from app.market.massive_client import MassiveDataSource
+from app.market.massive_client import EOD_POLL_INTERVAL, MassiveDataSource, extract_quote
 
 
 def _make_snapshot(ticker: str, price: float, timestamp_ns: int) -> TickerSnapshot:
@@ -197,8 +201,8 @@ class TestMassiveDataSource:
         await source.stop()
         assert source._task is None
 
-    async def test_start_immediate_poll(self):
-        """Test that start() does an immediate poll before starting the loop."""
+    async def test_start_polls_immediately(self):
+        """The polling task polls right away, without waiting a full interval."""
         cache = PriceCache()
         source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
 
@@ -207,8 +211,150 @@ class TestMassiveDataSource:
         with patch("app.market.massive_client.RESTClient"):
             with patch.object(source, "_fetch_snapshots", return_value=mock_snapshots):
                 await source.start(["AAPL"])
+                for _ in range(100):
+                    if "AAPL" in cache:
+                        break
+                    await asyncio.sleep(0.01)
 
-        # Cache should have data immediately from the first poll
         assert cache.get_price("AAPL") == 190.50
-
         await source.stop()
+
+    async def test_stop_during_first_poll(self):
+        """stop() during the first fetch cancels it: no cache write, no task left running."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
+        entered, release = threading.Event(), threading.Event()
+
+        def paused_fetch(tickers):
+            entered.set()
+            release.wait(5)
+            return [_make_snapshot("AAPL", 190.0, 1707580800_000_000_000)]
+
+        with patch("app.market.massive_client.RESTClient"):
+            with patch.object(source, "_fetch_snapshots", side_effect=paused_fetch):
+                await source.start(["AAPL"])
+                await asyncio.to_thread(entered.wait, 5)
+                task = source._task
+                await source.stop()
+                release.set()
+                await asyncio.sleep(0.05)
+
+        assert task.done()
+        assert source._task is None
+        assert "AAPL" not in cache
+
+
+class TestExtractQuote:
+    """Price fallback chain for plans that omit lastTrade."""
+
+    def test_last_trade_preferred(self):
+        snap = TickerSnapshot.from_dict({
+            "ticker": "AAPL",
+            "lastTrade": {"p": 190.5, "t": 1707580800_000_000_000},
+            "min": {"c": 189.0, "t": 1707580700_000},
+        })
+        assert extract_quote(snap) == (190.5, pytest.approx(1707580800.0))
+
+    def test_minute_bar_when_no_last_trade(self):
+        """Starter plans have no lastTrade; the minute bar (ms timestamp) is used."""
+        snap = TickerSnapshot.from_dict({"ticker": "AAPL", "min": {"c": 189.0, "t": 1707580700_000}})
+        assert extract_quote(snap) == (189.0, pytest.approx(1707580700.0))
+
+    def test_day_bar_with_updated(self):
+        snap = TickerSnapshot.from_dict(
+            {"ticker": "AAPL", "day": {"c": 188.0}, "updated": 1707580600_000_000_000}
+        )
+        assert extract_quote(snap) == (188.0, pytest.approx(1707580600.0))
+
+    def test_prev_day_close_not_used(self):
+        snap = TickerSnapshot.from_dict({"ticker": "AAPL", "prevDay": {"c": 187.0}})
+        assert extract_quote(snap) is None
+
+
+class FakeEodClient:
+    """Fake RESTClient: snapshots are not authorized; grouped bars exist for one date."""
+
+    def __init__(self, bar_date: str):
+        self.bar_date = bar_date
+        self.grouped_calls: list[str] = []
+
+    def get_snapshot_all(self, **kwargs):
+        raise BadResponse('{"status":"NOT_AUTHORIZED","message":"not entitled"}')
+
+    def get_grouped_daily_aggs(self, day, adjusted=True):
+        self.grouped_calls.append(day)
+        if day != self.bar_date:
+            return []
+        return [
+            GroupedDailyAgg.from_dict({"T": "AAPL", "c": 188.0, "t": 1707580800_000}),
+            GroupedDailyAgg.from_dict({"T": "MSFT", "c": 410.0, "t": 1707580800_000}),
+        ]
+
+
+@pytest.mark.asyncio
+class TestMassiveFallbacks:
+    """Minute-bar polling and the free-plan end-of-day fallback."""
+
+    async def test_poll_uses_minute_bar_without_last_trade(self):
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source._tickers = ["AAPL"]
+        source._client = MagicMock()
+        snap = TickerSnapshot.from_dict({"ticker": "AAPL", "min": {"c": 189.0, "t": 1707580700_000}})
+
+        with patch.object(source, "_fetch_snapshots", return_value=[snap]):
+            await source._poll_once()
+
+        assert cache.get_price("AAPL") == 189.0
+
+    async def test_not_authorized_switches_to_eod(self):
+        """A 403 on snapshots switches to grouped-daily EOD prices at a 60s interval."""
+        today = datetime.now(UTC).date()
+        bar_date = (today - timedelta(days=2)).isoformat()
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source._tickers = ["AAPL"]
+        source._client = FakeEodClient(bar_date)
+
+        await source._poll_once()  # snapshot rejected -> EOD mode
+        assert source._eod_mode
+        assert source._interval == EOD_POLL_INTERVAL
+        assert cache.get_price("AAPL") is None
+
+        await source._poll_once()  # discovery walks back to the bar date
+        assert cache.get_price("AAPL") == 188.0
+        assert "MSFT" not in cache  # untracked tickers are filtered out
+        assert len(source._client.grouped_calls) == 3
+
+        await source._poll_once()  # date cached: one call per poll
+        assert source._client.grouped_calls[3:] == [bar_date]
+
+    async def test_ticker_removed_during_poll_not_recached(self):
+        """A ticker removed while the fetch is in flight is not written back to the cache."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source._tickers = ["AAPL", "MSFT"]
+        source._client = MagicMock()
+        entered, release = threading.Event(), threading.Event()
+        requested = []
+
+        def paused_fetch(tickers):
+            requested.append(list(tickers))
+            entered.set()
+            release.wait(5)
+            return [
+                _make_snapshot("AAPL", 190.0, 1707580800_000_000_000),
+                _make_snapshot("MSFT", 410.0, 1707580800_000_000_000),
+            ]
+
+        with patch.object(source, "_fetch_snapshots", side_effect=paused_fetch):
+            poll = asyncio.create_task(source._poll_once())
+            await asyncio.to_thread(entered.wait, 5)
+            await source.remove_ticker("AAPL")
+            release.set()
+            await poll
+
+        assert requested == [["AAPL", "MSFT"]]
+        assert source.get_tickers() == ["MSFT"]
+        assert "AAPL" not in cache
+        assert cache.get_price("MSFT") == 410.0

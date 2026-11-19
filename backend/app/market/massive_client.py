@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, date, datetime, timedelta
 
 from massive import RESTClient
-from massive.rest.models import SnapshotMarketType
+from massive.exceptions import BadResponse
+from massive.rest.models import SnapshotMarketType, TickerSnapshot
 
 from .cache import PriceCache
 from .interface import MarketDataSource
@@ -14,6 +16,27 @@ from .interface import MarketDataSource
 logger = logging.getLogger(__name__)
 
 NS_PER_SECOND = 1_000_000_000
+MS_PER_SECOND = 1_000
+EOD_POLL_INTERVAL = 60.0  # grouped-daily mode: 1 call/min, within the free 5 calls/min
+EOD_MAX_LOOKBACK_DAYS = 5  # weekends plus a holiday
+
+
+def extract_quote(snap: TickerSnapshot) -> tuple[float, float] | None:
+    """Return (price, timestamp_seconds) from the freshest field the plan provides.
+
+    Order: last trade (ns), latest minute bar (ms), today's bar with `updated` (ns).
+    The previous day's close is never used as a live price.
+    """
+    lt = snap.last_trade
+    if lt and lt.price and lt.sip_timestamp:
+        return lt.price, lt.sip_timestamp / NS_PER_SECOND
+    m = snap.min
+    if m and m.close and m.timestamp:
+        return m.close, m.timestamp / MS_PER_SECOND
+    d = snap.day
+    if d and d.close and snap.updated:
+        return d.close, snap.updated / NS_PER_SECOND
+    return None
 
 
 class MassiveDataSource(MarketDataSource):
@@ -22,9 +45,12 @@ class MassiveDataSource(MarketDataSource):
     Polls GET /v2/snapshot/locale/us/markets/stocks/tickers for all watched
     tickers in a single API call, then writes results to the PriceCache.
 
+    If the plan lacks snapshots (403 NOT_AUTHORIZED, the free Basic plan), switches
+    once to end-of-day mode: grouped daily bars, polled every EOD_POLL_INTERVAL.
+
     Rate limits:
-      - Free tier: 5 req/min → poll every 15s (default)
-      - Paid tiers: higher limits → poll every 2-5s
+      - Free tier: 5 req/min → EOD mode, 1 call/min after daily date discovery
+      - Paid tiers: snapshot every 15s (default) or faster
     """
 
     def __init__(
@@ -39,14 +65,16 @@ class MassiveDataSource(MarketDataSource):
         self._tickers: list[str] = []
         self._task: asyncio.Task | None = None
         self._client: RESTClient | None = None
+        self._eod_mode = False
+        self._eod_date: date | None = None  # latest trading date with bars
+        self._eod_checked: date | None = None  # UTC day the date was discovered
 
     async def start(self, tickers: list[str]) -> None:
-        self._client = RESTClient(api_key=self._api_key)
+        # retries=0: the poll loop is the retry; client retries waste free-tier quota
+        self._client = RESTClient(api_key=self._api_key, retries=0)
         self._tickers = list(tickers)
-
-        # Do an immediate first poll so the cache has data right away
-        await self._poll_once()
-
+        # The first poll runs inside the task, so start() never blocks on the
+        # provider and stop() also cancels an in-flight first poll.
         self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
         logger.info(
             "Massive poller started: %d tickers, %.1fs interval",
@@ -83,49 +111,97 @@ class MassiveDataSource(MarketDataSource):
     # --- Internal ---
 
     async def _poll_loop(self) -> None:
-        """Poll on interval. First poll already happened in start()."""
+        """Poll immediately, then on every interval."""
         while True:
-            await asyncio.sleep(self._interval)
             await self._poll_once()
+            await asyncio.sleep(self._interval)
 
     async def _poll_once(self) -> None:
         """Execute one poll cycle: fetch snapshots, update cache."""
-        if not self._tickers or not self._client:
+        tickers = list(self._tickers)  # immutable request set for this poll
+        if not tickers or not self._client:
             return
 
         try:
             # The Massive RESTClient is synchronous — run in a thread to
             # avoid blocking the event loop.
-            snapshots = await asyncio.to_thread(self._fetch_snapshots)
-            processed = 0
-            for snap in snapshots:
-                try:
-                    price = snap.last_trade.price
-                    # LastTrade has no `timestamp` attribute: the trade time is
-                    # `sip_timestamp`, in Unix nanoseconds → convert to seconds.
-                    timestamp = snap.last_trade.sip_timestamp / NS_PER_SECOND
-                    self._cache.update(
-                        ticker=snap.ticker,
-                        price=price,
-                        timestamp=timestamp,
-                    )
-                    processed += 1
-                except (AttributeError, TypeError) as e:
-                    logger.warning(
-                        "Skipping snapshot for %s: %s",
-                        getattr(snap, "ticker", "???"),
-                        e,
-                    )
-            logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
-
+            if self._eod_mode:
+                quotes = await asyncio.to_thread(self._fetch_eod, tickers)
+            else:
+                quotes = await asyncio.to_thread(self._fetch_snapshot_quotes, tickers)
+        except BadResponse as e:
+            if "NOT_AUTHORIZED" in str(e) and not self._eod_mode:
+                self._enter_eod_mode()
+            else:
+                logger.error("Massive poll failed: %s", e)
+            return
         except Exception as e:
-            logger.error("Massive poll failed: %s", e)
             # Don't re-raise — the loop will retry on the next interval.
             # Common failures: 401 (bad key), 429 (rate limit), network errors.
+            logger.error("Massive poll failed: %s", e)
+            return
 
-    def _fetch_snapshots(self) -> list:
+        # Tickers removed while the request was in flight must not be re-cached
+        current = set(self._tickers)
+        processed = 0
+        for ticker, (price, timestamp) in quotes.items():
+            if ticker in current and self._cache.update(ticker=ticker, price=price, timestamp=timestamp):
+                processed += 1
+        logger.debug("Massive poll: updated %d/%d tickers", processed, len(tickers))
+
+    def _enter_eod_mode(self) -> None:
+        """Switch to grouped-daily EOD prices after the plan rejected snapshots."""
+        self._eod_mode = True
+        self._interval = max(self._interval, EOD_POLL_INTERVAL)
+        logger.warning(
+            "Massive plan lacks snapshots; using end-of-day prices every %.0fs", self._interval
+        )
+
+    def _fetch_snapshot_quotes(self, tickers: list[str]) -> dict[str, tuple[float, float]]:
+        """Fetch one batched snapshot and extract a quote per ticker. Runs in a thread."""
+        quotes = {}
+        for snap in self._fetch_snapshots(tickers):
+            quote = extract_quote(snap)
+            if quote:
+                quotes[snap.ticker] = quote
+            else:
+                logger.warning("Skipping snapshot for %s: no usable price", snap.ticker)
+        return quotes
+
+    def _fetch_snapshots(self, tickers: list[str]) -> list:
         """Synchronous call to the Massive REST API. Runs in a thread."""
         return self._client.get_snapshot_all(
             market_type=SnapshotMarketType.STOCKS,
-            tickers=self._tickers,
+            tickers=tickers,
         )
+
+    def _fetch_eod(self, tickers: list[str]) -> dict[str, tuple[float, float]]:
+        """Latest end-of-day close per tracked ticker. Runs in a thread.
+
+        Discovers the latest trading date (walking back over weekends/holidays)
+        at most once per UTC day; other polls cost a single call.
+        """
+        today = datetime.now(UTC).date()
+        if self._eod_checked == today:
+            bars = self._client.get_grouped_daily_aggs(self._eod_date.isoformat(), adjusted=True)
+        else:
+            found = self._discover_eod(today)
+            if found is None:
+                return {}
+            (self._eod_date, bars), self._eod_checked = found, today
+        wanted = set(tickers)
+        return {
+            b.ticker: (b.close, b.timestamp / MS_PER_SECOND)
+            for b in bars
+            if b.ticker in wanted and b.close and b.timestamp
+        }
+
+    def _discover_eod(self, today: date) -> tuple[date, list] | None:
+        """Most recent (date, bars), up to EOD_MAX_LOOKBACK_DAYS back, that has grouped bars."""
+        for days_back in range(EOD_MAX_LOOKBACK_DAYS):
+            day = today - timedelta(days=days_back)
+            bars = self._client.get_grouped_daily_aggs(day.isoformat(), adjusted=True)
+            if bars:
+                return day, bars
+        logger.error("Massive: no grouped daily bars in the last %d days", EOD_MAX_LOOKBACK_DAYS)
+        return None
